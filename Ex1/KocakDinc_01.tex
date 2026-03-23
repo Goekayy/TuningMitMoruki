@@ -1,0 +1,177 @@
+\documentclass[11pt]{scrartcl}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[top=1.5cm]{geometry}
+\usepackage{url}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\setlength{\parindent}{0em}
+\setlength{\parskip}{0.5em}
+
+\renewcommand{\thesubsection}{\arabic{subsection}}
+
+\lstdefinestyle{dbtsql}{
+  language=SQL,
+  basicstyle=\small\ttfamily,
+  keywordstyle=\color{magenta!75!black},
+  stringstyle=\color{green!50!black},
+  showspaces=false,
+  showstringspaces=false,
+  commentstyle=\color{gray}}
+
+\title{
+  \textbf{\large Assignment 1} \\
+  Uploading Data to the Database \\
+  {\large Database Tuning}}
+
+\author{
+  Group Name \\
+  \large Osman Kocak \\
+  \large Gökay Dincs \\
+  
+}
+
+\begin{document}
+
+\maketitle
+
+\subsection*{Experimental Setup}
+
+The experiments were executed on a local Windows machine using PowerShell and Python 3.11.4. For PostgreSQL, version 15.3 with the Python driver \texttt{psycopg 3.3.3} was used. For the portability comparison, MariaDB 12.2.2 with \texttt{PyMySQL 1.1.2} was installed locally. PostgreSQL was accessed on \texttt{localhost:5432}, MariaDB on \texttt{localhost:3306}.
+
+The imported input file was \texttt{dblp/auth.tsv}. It contains 3,095,201 tab-separated tuples with the attributes \texttt{name} and \texttt{pubid}. The target schema was:
+
+\begin{lstlisting}[style=dbtsql]
+CREATE TABLE IF NOT EXISTS auth (
+    name VARCHAR(49),
+    pubid VARCHAR(129)
+);
+\end{lstlisting}
+
+Client and server were executed on the same machine. Therefore, external network latency did not influence the measurements and the runtimes are directly comparable.
+
+\subsection*{Straightforward Implementation}
+
+\paragraph{Implementation}
+
+The straightforward implementation loads the TSV file line by line and executes one \texttt{INSERT} statement for every tuple. In the Python program, the file is read sequentially, each line is split into \texttt{(name, pubid)}, and then inserted individually into the database. The transaction is committed only once at the end of the load.
+
+This approach is implemented in \texttt{load\_auth.py} in the function \texttt{load\_naive(...)}.
+
+\begin{lstlisting}[style=dbtsql]
+INSERT INTO auth (name, pubid) VALUES (%s, %s);
+\end{lstlisting}
+
+\subsection*{Efficient Approaches}
+
+\subsubsection*{Efficient Approach 1: Batch Insert}
+
+\paragraph{Implementation}
+
+The first efficient approach groups tuples in memory and inserts them blockwise instead of sending one statement per row. In the implementation, tuples are collected in batches of 5000 rows and then written with \texttt{executemany(...)}. This keeps the SQL statement identical, but reduces the number of separate database calls significantly.
+
+This approach is implemented in \texttt{load\_auth.py} in the function \texttt{load\_batch(...)}.
+
+\begin{lstlisting}[style=dbtsql]
+INSERT INTO auth (name, pubid) VALUES (%s, %s);
+\end{lstlisting}
+
+\paragraph{Why is this approach efficient?}
+
+This approach is more efficient because it reduces the fixed overhead per tuple. In the straightforward version, every row triggers a separate client-server interaction and a separate statement execution. With batching, many tuples are processed together. This reduces protocol overhead, decreases the number of executor invocations, and lowers the amount of administrative work per row. The idea follows the tuning principle that start-up costs are high and should therefore be amortized over larger units of work.
+
+\paragraph{Tuning principle}
+
+The best fitting tuning principle is \emph{``Start-up costs are high; running costs are low.''} The batched approach reduces the repeated start-up cost of many individual \texttt{INSERT} statements.
+
+\subsubsection*{Efficient Approach 2: PostgreSQL COPY FROM STDIN}
+
+\paragraph{Implementation}
+
+The second efficient approach uses PostgreSQL's native bulk-load mechanism \texttt{COPY FROM STDIN}. Instead of executing many SQL \texttt{INSERT} statements, the client streams the file contents directly into PostgreSQL. For the full import, the file is transferred in larger chunks. For limited runs, row-wise \texttt{COPY} is used.
+
+This approach is implemented in \texttt{load\_auth.py} in the function \texttt{load\_copy(...)}.
+
+\begin{lstlisting}[style=dbtsql]
+COPY auth (name, pubid)
+FROM STDIN
+WITH (FORMAT csv, DELIMITER E'\t', QUOTE E'\b', ESCAPE E'\b');
+\end{lstlisting}
+
+\paragraph{Why is this approach efficient?}
+
+\texttt{COPY} is more efficient because it bypasses most of the repeated SQL statement overhead. PostgreSQL can process the import as a continuous bulk stream instead of many small statements. This reduces client-server protocol overhead, avoids repeated statement execution boundaries, improves cache locality, and uses a DBMS-internal import path optimized for large data transfers. In practice, this was the fastest PostgreSQL method in the experiment.
+
+\paragraph{Tuning principle}
+
+The best fitting tuning principle is again \emph{``Start-up costs are high; running costs are low.''} A second fitting principle is \emph{``Render on the server what is due on the server,''} because the actual bulk loading is handled largely by the DBMS itself.
+
+\subsubsection*{Portability}
+
+\paragraph{Implementation}
+
+For portability, a second DBMS was set up locally: MariaDB 12.2.2. The general structure of the program remained unchanged: argument parsing, line-by-line file reading, tuple parsing, and control flow were reused. Only the DBMS-specific parts had to be changed:
+
+\begin{itemize}
+  \item Python driver: \texttt{psycopg} was replaced with \texttt{PyMySQL}
+  \item Connection settings: port \texttt{5432} was replaced with \texttt{3306}
+  \item SQL identifier handling had to be adapted
+  \item PostgreSQL \texttt{COPY FROM STDIN} was replaced by MariaDB \texttt{LOAD DATA LOCAL INFILE}
+\end{itemize}
+
+The corresponding MariaDB implementation is contained in \texttt{load\_auth\_mariadb.py}.
+
+\begin{lstlisting}[style=dbtsql]
+LOAD DATA LOCAL INFILE 'C:/path/to/auth.tsv'
+INTO TABLE auth
+FIELDS TERMINATED BY '\t'
+LINES TERMINATED BY '\n'
+(name, pubid);
+\end{lstlisting}
+
+\paragraph{Did you observe performance differences. If so: Why. If not: Why not?}
+
+Yes. The same qualitative ranking was observed in both systems: the straightforward approach was the slowest, batch insert was faster, and the native bulk-load mechanism was the fastest. However, the absolute runtimes differed. On this machine, PostgreSQL \texttt{COPY} was faster than MariaDB \texttt{LOAD DATA LOCAL INFILE} for the full import, while MariaDB showed very strong performance for batch inserts.
+
+This is plausible because both systems implement their own internal execution paths, buffering strategies, and bulk-load mechanisms. Therefore, the optimization principle is portable, even if the exact runtimes are system-dependent.
+
+\subsection*{Runtime Experiment}
+
+\paragraph{Notes}
+
+\begin{itemize}
+  \item The straightforward approach was measured on a subset of 100,000 tuples and the full runtime was estimated linearly.
+  \item All efficient approaches were measured with real runtimes. For PostgreSQL, full measurements were available for \texttt{batch} and \texttt{copy}. For MariaDB, full measurements were available for \texttt{batch} and \texttt{load-data}.
+  \item Database server and client both ran on the same local machine.
+\end{itemize}
+
+\begin{table}[H]
+  \centering
+  \begin{tabular}{l|r}
+    Approach & Runtime [sec] \tabularnewline
+    \hline
+    Straightforward (\texttt{naive}, estimated full runtime) & 151.43 \tabularnewline
+    Batch Insert (PostgreSQL, full runtime) & 50.515 \tabularnewline
+    COPY FROM STDIN (PostgreSQL, full runtime) & 3.158 \tabularnewline
+    LOAD DATA LOCAL INFILE (MariaDB, full runtime) & 6.592 \tabularnewline
+  \end{tabular}
+\end{table}
+
+For reference, the subset measurements over 100,000 tuples were:
+
+\begin{itemize}
+  \item PostgreSQL \texttt{naive}: 4.892 s
+  \item PostgreSQL \texttt{batch}: 1.763 s
+  \item PostgreSQL \texttt{copy}: 0.079 s
+  \item MariaDB \texttt{naive}: 6.971 s
+  \item MariaDB \texttt{batch}: 0.536 s
+  \item MariaDB \texttt{load-data}: 0.312 s
+\end{itemize}
+
+The PostgreSQL subset measurements show that \texttt{batch} was about 2.77x faster than \texttt{naive}, while \texttt{copy} was about 61.92x faster than \texttt{naive}. In MariaDB, \texttt{batch} was about 13.01x faster than \texttt{naive}, and \texttt{load-data} about 22.34x faster.
+
+
+\end{document}

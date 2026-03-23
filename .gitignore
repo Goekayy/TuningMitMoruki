@@ -4,3 +4,5 @@ __pycache__/
 
 dblp/*.tsv
 Ex1/dblp.zip
+Ex1/*.err
+Ex1/*.log
